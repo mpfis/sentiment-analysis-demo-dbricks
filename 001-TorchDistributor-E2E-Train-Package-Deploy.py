@@ -21,6 +21,48 @@ import mlflow.spark
 import mlflow.sklearn
 from sklearn.model_selection import train_test_split
 from mlflow.exceptions import RestException
+## import the TorchDistributor library
+from pyspark.ml.torch.distributor import TorchDistributor
+
+# COMMAND ----------
+
+class ReviewsDataModule(pl.LightningDataModule):
+  def __init__(self, data_dir, batch_size=32):
+    super().__init__()
+    self.data_dir = data_dir
+    self.batch_size = batch_size
+
+  # STEP 1: CLEAN AND PREP DATA FROM CSV
+  def clean_text(self, text):
+    import re
+    # Remove special characters, numbers, and extra whitespace
+    text = re.sub(r'[^a-zA-Z\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip().lower()
+    return text
+
+  def prep_raw_data_for_tokenization (self):
+    import pandas as pd
+    data_df = spark.read.csv(self.data_dir, header=True, inferSchema=True).where("Sentiment NOT LIKE '%the damage%'") \
+                    .withColumn("SentimentScore", when(col("Sentiment") == "positive", 0).when(col("Sentiment") == "negative", 1).otherwise(2))
+    prompts = [prompt[0] for prompt in data_df.select("Sentence").collect()]
+    labels = [label[0] for label in data_df.select("Sentiment").collect()]
+    jsons = ",".join([json.dumps({"full_text": prompt, "label":labels[i], "index":i}) for i, prompt in enumerate(prompts)])
+    prepped_df = pd.read_json(jsons, lines=True)
+    prepped_df["full_text"] = prepped_df["full_text"].apply(self.clean_text)
+    return prepped_df
+
+  # STEP 2: TOKENIZE AND BUILD VOCAB FROM CLEANED DATA
+  def tokenize_and_build_vocab (self, prepped_df):
+    from collections import Counter
+    from itertools import chain
+    from nltk.tokenize import word_tokenize
+    nltk.download('punkt')
+    tokenized_prompts = [word_tokenize(prompt) for prompt in prepped_df["full_text"]]
+    word_counts = Counter(chain(*tokenized_prompts))
+    vocab = {'<PAD>': 0, '<UNK>': 1}
+    vocab.update({word: i + 2 for i, (word, _) in enumerate(word_counts.most_common())})
+    return tokenized_prompts, vocab
 
 # COMMAND ----------
 
@@ -29,40 +71,6 @@ DB_NAME = "sentiment_analysis_demodb"
 spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
 sentiment_df = spark.read.csv(f"file:///Workspace/Repos/{username}/sentiment-analysis-demo-dbricks/data/data.csv", header=True, inferSchema=True).where("Sentiment NOT LIKE '%the damage%'").withColumn("SentimentScore", when(col("Sentiment") == "positive", 0).when(col("Sentiment") == "negative", 1).otherwise(2))
 promptsDF, labelsDF = sentiment_df.select("Sentence"), sentiment_df.select("SentimentScore")
-
-# COMMAND ----------
-
-import pandas as pd
-list_of_prompts = [prompt[0] for prompt in promptsDF.collect()]
-labels = [label[0] for label in labelsDF.collect()]
-labels_df = pd.DataFrame(labels, columns=["label"])
-
-# COMMAND ----------
-
-import json
-import pandas as pd
-jsons = ",".join([json.dumps({"full_text": prompt, "label":labels[i], "index":i}) for i, prompt in enumerate(list_of_prompts)])
-reviews_df = pd.read_json(jsons, lines=True)
-reviews_df
-
-# COMMAND ----------
-
-
-import re
-from sklearn.model_selection import train_test_split
-
-# clean the reviews 
-def clean_text(text):
-    # Remove special characters, numbers, and extra whitespace
-    text = re.sub(r'[^a-zA-Z\s]', '', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = text.strip().lower()
-    return text
-
-reviews_df["full_text"] = reviews_df["full_text"].apply(clean_text)
-
-
-
 
 # COMMAND ----------
 
