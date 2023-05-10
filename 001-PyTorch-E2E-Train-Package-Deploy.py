@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md 
-# MAGIC # 001-Train-Model
+# MAGIC # Part I: Prep, Train, and Test PyTorch Model
 
 # COMMAND ----------
 
@@ -24,32 +24,52 @@ from mlflow.exceptions import RestException
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ### Quick Dataset Sample Upload  
+# MAGIC In the repository associated with this demo there is a folder with the data. The demo **assumes you register the repository in a User folder within Repos**.
+
+# COMMAND ----------
+
+# read sample data into Spark DataFrames for prompts and labels
 username = spark.sql("SELECT current_user()").collect()[0][0]
-DB_NAME = "sentiment_analysis_demodb"
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
 sentiment_df = spark.read.csv(f"file:///Workspace/Repos/{username}/sentiment-analysis-demo-dbricks/data/data.csv", header=True, inferSchema=True).where("Sentiment NOT LIKE '%the damage%'").withColumn("SentimentScore", when(col("Sentiment") == "positive", 0).when(col("Sentiment") == "negative", 1).otherwise(2))
 promptsDF, labelsDF = sentiment_df.select("Sentence"), sentiment_df.select("SentimentScore")
 
 # COMMAND ----------
 
-import pandas as pd
-list_of_prompts = [prompt[0] for prompt in promptsDF.collect()]
-labels = [label[0] for label in labelsDF.collect()]
-labels_df = pd.DataFrame(labels, columns=["label"])
+# MAGIC %md
+# MAGIC If you did not use Repos and just downloaded this notebook, then go to the [data.csv location](https://github.com/mpfis/sentiment-analysis-demo-dbricks/blob/main/data/data.csv) in the GitHub Repository and download the data.  
+# MAGIC
+# MAGIC Then come back to the workspace and go to File > Upload data to DBFS > choose the location of the data.csv > copy the path > enter the path in DBFS into the variable `PATH_TO_UPLOADED_DATA` below.  
+# MAGIC   
+# MAGIC Uncomment below cell, and comment the cell above.
 
 # COMMAND ----------
 
-import json
+# read in data via upload
+# PATH_TO_UPLOADED_DATA = "ENTER PATH HERE"
+# sentiment_df = spark.read.csv(f"{PATH_TO_UPLOADED_DATA}", header=True, inferSchema=True).where("Sentiment NOT LIKE '%the damage%'").withColumn("SentimentScore", when(col("Sentiment") == "positive", 0).when(col("Sentiment") == "negative", 1).otherwise(2))
+# promptsDF, labelsDF = sentiment_df.select("Sentence"), sentiment_df.select("SentimentScore")
+
+# COMMAND ----------
+
 import pandas as pd
+import json
+list_of_prompts = [prompt[0] for prompt in promptsDF.collect()]
+labels = [label[0] for label in labelsDF.collect()]
+# format prompts and labels into the necessary JSON format
 jsons = ",".join([json.dumps({"full_text": prompt, "label":labels[i], "index":i}) for i, prompt in enumerate(list_of_prompts)])
 reviews_df = pd.read_json(jsons, lines=True)
 reviews_df
 
 # COMMAND ----------
 
-
 import re
 from sklearn.model_selection import train_test_split
+import nltk
+from collections import Counter
+from itertools import chain
+nltk.download('punkt')
 
 # clean the reviews 
 def clean_text(text):
@@ -59,19 +79,7 @@ def clean_text(text):
     text = text.strip().lower()
     return text
 
-reviews_df["full_text"] = reviews_df["full_text"].apply(clean_text)
-
-
-
-
-# COMMAND ----------
-
-import nltk
-from collections import Counter
-from itertools import chain
-nltk.download('punkt')
-
-# tokenize the cleaned output
+# tokenize the cleaned output and return the vocab object
 def tokenize_and_build_vocab (reviews_df):
   from nltk.tokenize import word_tokenize
   tokenized_reviews = [word_tokenize(review) for review in reviews_df["full_text"]]
@@ -80,7 +88,8 @@ def tokenize_and_build_vocab (reviews_df):
   vocab.update({word: i + 2 for i, (word, _) in enumerate(word_counts.most_common())})
   return tokenized_reviews, vocab
 
-# COMMAND ----------
+## gets rid of special characters and other unneccessary elements in the text
+reviews_df["full_text"] = reviews_df["full_text"].apply(clean_text)
 
 ## Convert tokenized vocab into word indicies so that it can be used as input data for the PyTorch model
 tokenized_reviews, vocab = tokenize_and_build_vocab(reviews_df)
@@ -110,13 +119,11 @@ padded_reviews = padded_reviews[:, :max_length]
 
 # COMMAND ----------
 
+from torch.utils.data import DataLoader, Dataset
 # split the datasets into train, test, validate datasets
 X_train, X_test, y_train, y_test = train_test_split(padded_reviews, reviews_df['label'], test_size=0.2, random_state=42)
 X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
 
-# COMMAND ----------
-
-from torch.utils.data import DataLoader, Dataset
 # Create train, validation, and test data
 train_data = list(zip(X_train, y_train))
 val_data = list(zip(X_val, y_val))
@@ -131,6 +138,16 @@ test_loader = DataLoader(test_data, batch_size=32)
 
 # MAGIC %md
 # MAGIC ## Define the Model and PyFunc Wrapper
+# MAGIC There are two crucial elements to the broader training process especially if the ultimate goal is to package and deploy that model to Databricks Model Serving. We need to make sure we are defining two Python classes:  
+# MAGIC - Model Class  
+# MAGIC - PyFunc Wrapper Class  
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Model Class
+# MAGIC   
+# MAGIC The Model Class defines the instructions for training the neural network (i.e. framework, backward and forward passes). This class will mainly be definitions of the steps to train a neural network / Deep Learning model based on whatever framework you have chosen. In our case, we chose PyTorch Lightning and LSTM as the algorithm. Therefore, we add in the necessary tasks to train a PyTorch Lightning model that relies on LSTM.
 
 # COMMAND ----------
 
@@ -178,56 +195,21 @@ class SentimentModel(pl.LightningModule):
         self.log('test_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### PyFunc Wrapper Class
+# MAGIC The next class that we have to define is the PyFunc Wrapper Class. This allows us to wrap the model we defined in the Model Class and that we will be training below into a PyFunc that can be loaded for various types of inference scenarios. Whether we are loading the model to do batch inference or deploying it to an endpoint using Model Serving, the PyFunc method will allow us to properly package our model and define the prediction process that will be called when we send new data to the model to be scored.  
+# MAGIC   
+# MAGIC There are different examples on how to define a PyFunc wrapper, some methods use the `load_context()` method to load initial variables and artifacts from MLFlow; however, if your plan is to deploy the model to a serverless endpoint through Model Serving (like our goal is for this demo) then it might be better to use a more traditional `__init__()` function to allow for the direct passing of values and objects to the PyFunc.  
+# MAGIC   
+# MAGIC This allows us to instantiate the PyFunc wrapper with the necessary elements and directly log it to MLFlow, which, in turn, allows Model Serving to take the whole package, containerize, and deploy on the serverless architecture that supports the Model Serving feature. This is important because if you try to load artifacts from the tracking server in the PyFunc and you are trying to use Model Serving, your deployment will fail because the endpoint **does not have access to the artifacts on the tracking server**. Anything you need for the model endpoint so that it initialize and properly score new data **needs to be logged with the model**. 
 
 # COMMAND ----------
 
-import mlflow
-from mlflow.tracking import MlflowClient
-client = MlflowClient()
-username = spark.sql("SELECT current_user()").collect()[0][0]
-experiment_name = "sentiment_analysis_ex"
-try:
-  experiment_id = client.create_experiment(f"/Users/{username}/{experiment_name}/")
-except Exception as e:
-  print(e)
-mlflow.set_experiment(f"/Users/{username}/{experiment_name}/")
-
-# COMMAND ----------
-
-conda_env = {
-    "channels": ["defaults"],
-    "dependencies": [
-      "python=3.10.6",
-      "pip",
-      {"pip": [
-          "mlflow<3,>=2.2",
-          "accelerate==0.16.0",
-          "attrs==21.4.0",
-          "boto3==1.24.28",
-          "cffi==1.15.1",
-          "cloudpickle==2.0.0",
-          "configparser==5.2.0",
-          "defusedxml==0.7.1",
-          "dill==0.3.4",
-          "fsspec==2022.7.1",
-          "googleapis-common-protos==1.56.4",
-          "ipython==8.10.0",
-          "lightning-utilities==0.8.0",
-          "nltk==3.7",
-          "pandas==1.4.4",
-          "pytorch-lightning==2.0.2",
-          "rich==13.3.5",
-          "scipy==1.9.1",
-          "tensorflow==2.11.0",
-          "torch==1.13.1",
-          "torchmetrics==0.11.4",
-          "torchvision==0.14.1",
-          "transformers==4.26.1"
-        ],
-      },
-    ],
-    "name": "mlflow-env"
-}
+# MAGIC %md
+# MAGIC #### Note on Formatting Model Inputs  
+# MAGIC Model Inputs for PyFunc models need to either be column-based Pandas DataFrames or tensor-based numPy arrays. You cannot send a raw tensor to a custom PyFunc model. In our scenario, we chose to assume we are receiving a column-based Pandas DataFrame and then include the method `generate_tensor()` which takes the `model_input` (i.e. the DataFrame) and then converts it into the necessary tensor object to be used in the scoring process by the PyTorch model.
 
 # COMMAND ----------
 
@@ -236,14 +218,19 @@ import mlflow.pyfunc
 
 class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
 
-
+  # method used to instantiate the PyFunc model with the 
+  # necessary values and objects, including the model
   def __init__ (self, model, max_length, vocab):
     self.model = model
     self.max_length = max_length
     self.vocab = vocab
+    # this is used in generate_tensor() loading it here so
+    # it isn't downloaded everytime generate_tensor is called
     from nltk.tokenize import word_tokenize
     nltk.download('punkt')
 
+  # method included for helping format and process the model_input
+  # to get it into the format required for scoring with the PyTorch model
   def generate_tensor (self, new_review, vocab, max_length):
     import torch
     from nltk.tokenize import word_tokenize
@@ -260,6 +247,7 @@ class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
     input_tensor = torch.tensor(padded_review, dtype=torch.long).unsqueeze(0)
     return input_tensor
 
+  # method that gets called to score new data
   def predict (self, context, model_input):
     import torch
     import json
@@ -287,6 +275,60 @@ class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Connect to Experiment in MLFlow  
+# MAGIC In the following cell, we establish our connection to an MLFlow experiment so that anything that needs to be logged during the training process is organized in the experiment.  
+# MAGIC   
+# MAGIC Additionally, we define the necessary libraries in a `conda_env` structure to be logged along with the model so that when it is deployed the necessary libraries can be installed alongside it.
+
+# COMMAND ----------
+
+import mlflow
+from mlflow.tracking import MlflowClient
+client = MlflowClient()
+username = spark.sql("SELECT current_user()").collect()[0][0]
+experiment_name = "sentiment_analysis_ex"
+try:
+  experiment_id = client.create_experiment(f"/Users/{username}/{experiment_name}/")
+except Exception as e:
+  print(e)
+mlflow.set_experiment(f"/Users/{username}/{experiment_name}/")
+
+# TODO: cut unnecessary libraries
+conda_env = {
+    "channels": ["defaults"],
+    "dependencies": [
+      "python=3.10.6",
+      "pip",
+      {"pip": [
+          "mlflow<3,>=2.2",
+          "accelerate==0.16.0",
+          "attrs==21.4.0",
+          "cffi==1.15.1",
+          "cloudpickle==2.0.0",
+          "configparser==5.2.0",
+          "dill==0.3.4",
+          "fsspec==2022.7.1",
+          "googleapis-common-protos==1.56.4",
+          "ipython==8.10.0",
+          "lightning-utilities==0.8.0",
+          "nltk==3.7",
+          "pandas==1.4.4",
+          "pytorch-lightning==2.0.2",
+          "rich==13.3.5",
+          "scipy==1.9.1",
+          "torch==1.13.1",
+          "torchmetrics==0.11.4",
+          "torchvision==0.14.1",
+          "transformers==4.26.1"
+        ],
+      },
+    ],
+    "name": "mlflow-env"
+}
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Train the Model
 
 # COMMAND ----------
@@ -300,7 +342,6 @@ with mlflow.start_run(nested=True, run_name=f"sentiment-analysis-model-{exp_run_
   from pytorch_lightning import Trainer
   # Auto log all MLflow entities
   mlflow.pytorch.autolog()
-  # log run id
   # Define the model's hyperparameters
   vocab_size = len(vocab)
   embed_dim = 100
@@ -320,12 +361,13 @@ with mlflow.start_run(nested=True, run_name=f"sentiment-analysis-model-{exp_run_
   signature = infer_signature(input_df)
   mlflow.pytorch.log_model(trainer.model, artifact_path="pytorch-model", pickle_module=pickle, signature=signature, input_example=input_df)
   # log artifacts, objects, and model
-  run_id = run.info.run_id
-  pytorch_model_uri = f"runs:/{run_id}/pytorch-model"
   # pass the model object, the max_length value, and the vocab object to the broader PyFunc Definition to be
   # packaged and logged with this run so that it can be properly containerized and serving using Model Serving
   python_model = SentimentModelWrapper(model, max_length, vocab)
   mlflow.pyfunc.log_model("model", python_model=python_model, signature=signature, conda_env=conda_env, input_example=input_df)
+  # saving these values to make the testing a bit easier in the next step
+  run_id = run.info.run_id
+  pytorch_model_uri = f"runs:/{run_id}/pytorch-model"
   print(pytorch_model_uri)
 
 # COMMAND ----------
@@ -351,7 +393,16 @@ pred
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC # Part II: Register and Deploy Model
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Register Trained Model with MLFlow Model Registry
+
+# COMMAND ----------
+
+model_name = "sentiment_analysis_model"
 
 # COMMAND ----------
 
@@ -359,7 +410,7 @@ model_details = mlflow.register_model(model_uri=uri, name=model_name)
 
 # COMMAND ----------
 
-## Transition to Staging
+## Transition to Production
 client.transition_model_version_stage(
     name=model_name, version=model_details.version, stage="Production"
 )
@@ -381,12 +432,93 @@ pred
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Configure and Deploy Model to Endpoint
+
+# COMMAND ----------
+
+def func_create_endpoint(instance, model_serving_endpoint_name, endpoint_config):
+  #get endpoint status
+  endpoint_url = f"https://{instance}/api/2.0/serving-endpoints"
+  url = f"{endpoint_url}/{model_serving_endpoint_name}"
+  r = requests.get(url, headers=headers)
+  if "RESOURCE_DOES_NOT_EXIST" in r.text:  
+    print("Creating this new endpoint: ", f"https://{instance}/serving-endpoints/{model_serving_endpoint_name}/invocations")
+    re = requests.post(endpoint_url, headers=headers, json=endpoint_config)
+  else:
+    new_model_version = (endpoint_config['config'])['served_models'][0]['model_version']
+    print("This endpoint existed previously! We are updating it to a new config with new model version: ", new_model_version)
+    # update config
+    url = f"{endpoint_url}/{model_serving_endpoint_name}/config"
+    re = requests.put(url, headers=headers, json=endpoint_config['config']) 
+    # wait till new config file in place
+    import time,json
+    #get endpoint status
+    url = f"https://{instance}/api/2.0/serving-endpoints/{model_serving_endpoint_name}"
+    retry = True
+    total_wait = 0
+    while retry:
+      r = requests.get(url, headers=headers)
+      assert r.status_code == 200, f"Expected an HTTP 200 response when accessing endpoint info, received {r.status_code}"
+      endpoint = json.loads(r.text)
+      if "pending_config" in endpoint.keys():
+        seconds = 10
+        print("New config still pending")
+        if total_wait < 6000:
+          #if less the 10 mins waiting, keep waiting
+          print(f"Wait for {seconds} seconds")
+          print(f"Total waiting time so far: {total_wait} seconds")
+          time.sleep(10)
+          total_wait += seconds
+        else:
+          print(f"Stopping,  waited for {total_wait} seconds")
+          retry = False  
+      else:
+        print("New config in place now!")
+        retry = False
+  assert re.status_code == 200, f"Expected an HTTP 200 response, received {re.status_code}"
+
+# COMMAND ----------
+
+from mlflow.tracking.client import MlflowClient
+def get_latest_model_version(model_name):
+  client = MlflowClient()
+  models = mlflow_client.get_latest_versions(model_name, stages=["Production"])
+  for m in models:
+    new_model_version = m.version
+  return new_model_version
+
+# COMMAND ----------
+
+endpoint_config = {
+  "name": model_serving_endpoint_name,
+  "config": {
+   "served_models": [{
+     "model_name": model_name,
+     "model_version": get_latest_model_version(model_name=model_name),
+     "workload_size": "Small",
+     "scale_to_zero_enabled": True
+   }]
+ }
+}
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Using the two functions defined above, the endpoint will be created. This could take some time, so check the Serving section to see when your model endpoint has been successfully deployed.
+
+# COMMAND ----------
+
+func_create_endpoint(model_serving_endpoint_name)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Test Endpoint
 
 # COMMAND ----------
 
-def score_model(dataset):
-  url = 'https://e2-demo-field-eng.cloud.databricks.com/serving-endpoints/sentiment_analysis_endpoint/invocations'
+def score_model(instance, endpoint_name, dataset):
+  url = f'https://{instance}/serving-endpoints/{endpoint_name}/invocations'
   token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
   headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
   ds_dict = {'dataframe_split': dataset.to_dict(orient='split')} if isinstance(dataset, pd.DataFrame) else create_tf_serving_json(dataset)
@@ -398,10 +530,14 @@ def score_model(dataset):
 
 # COMMAND ----------
 
-import requests
-#input_df = pd.DataFrame([reviews_df.iloc[5836]["full_text"]], columns=["input"])
-score_model(input_df)
+# MAGIC %md
+# MAGIC **NOTE**: Replace `ENTER URL HERE` with whatever databricks instance name is in between `https://` and the `/` before `o?=XXXXXX`.
 
 # COMMAND ----------
 
+url = "ENTER URL HERE"
 
+# COMMAND ----------
+
+import requests
+score_model(url, "sentiment_analysis_endpoint", input_df)
