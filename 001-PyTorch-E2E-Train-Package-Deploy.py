@@ -21,6 +21,7 @@ import mlflow.spark
 import mlflow.sklearn
 from sklearn.model_selection import train_test_split
 from mlflow.exceptions import RestException
+import requests
 
 # COMMAND ----------
 
@@ -64,13 +65,18 @@ reviews_df
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Toktok alternative
+# MAGIC
+# MAGIC We use TokTokTokenizer because it has no dependenices to download. Much lighter, allows for faster deployment.
+
+# COMMAND ----------
+
 import re
 from sklearn.model_selection import train_test_split
 import nltk
 from collections import Counter
 from itertools import chain
-nltk.download('punkt')
-
 # clean the reviews 
 def clean_text(text):
     # Remove special characters, numbers, and extra whitespace
@@ -81,8 +87,9 @@ def clean_text(text):
 
 # tokenize the cleaned output and return the vocab object
 def tokenize_and_build_vocab (reviews_df):
-  from nltk.tokenize import word_tokenize
-  tokenized_reviews = [word_tokenize(review) for review in reviews_df["full_text"]]
+  from nltk.tokenize import ToktokTokenizer
+  toktok = ToktokTokenizer()
+  tokenized_reviews = [toktok.tokenize(review) for review in reviews_df["full_text"]]
   word_counts = Counter(chain(*tokenized_reviews))
   vocab = {'<PAD>': 0, '<UNK>': 1}
   vocab.update({word: i + 2 for i, (word, _) in enumerate(word_counts.most_common())})
@@ -215,7 +222,6 @@ class SentimentModel(pl.LightningModule):
 
 import mlflow.pyfunc
 
-
 class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
 
   # method used to instantiate the PyFunc model with the 
@@ -224,27 +230,25 @@ class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
     self.model = model
     self.max_length = max_length
     self.vocab = vocab
-    # this is used in generate_tensor() loading it here so
-    # it isn't downloaded everytime generate_tensor is called
-    from nltk.tokenize import word_tokenize
-    nltk.download('punkt')
 
   # method included for helping format and process the model_input
   # to get it into the format required for scoring with the PyTorch model
-  def generate_tensor (self, new_review, vocab, max_length):
+  def generate_tensor (self, new_text, vocab, max_length):
     import torch
-    from nltk.tokenize import word_tokenize
-    # Assuming 'new_review' is a string containing the new movie review text
-    tokenized_review = word_tokenize(new_review)
+    from nltk.tokenize import ToktokTokenizer
+    toktok = ToktokTokenizer()
+
+    # Assuming 'new_text' is a string containing the new text
+    tokenized_text = toktok.tokenize(new_text)
 
     # Convert words to indices using the vocabulary
-    indexed_review = [vocab.get(word, vocab['<UNK>']) for word in tokenized_review]
+    indexed_text = [vocab.get(word, vocab['<UNK>']) for word in tokenized_text]
 
     # Pad or truncate the sequence to the same length as your training data (max_length)
-    padded_review = indexed_review[:max_length] + [vocab['<PAD>']] * (max_length - len(indexed_review))
+    padded_text = indexed_text[:max_length] + [vocab['<PAD>']] * (max_length - len(indexed_text))
 
     # Convert the input to a PyTorch tensor and add a batch dimension
-    input_tensor = torch.tensor(padded_review, dtype=torch.long).unsqueeze(0)
+    input_tensor = torch.tensor(padded_text, dtype=torch.long).unsqueeze(0)
     return input_tensor
 
   # method that gets called to score new data
@@ -279,6 +283,7 @@ class SentimentModelWrapper(mlflow.pyfunc.PythonModel):
 # MAGIC In the following cell, we establish our connection to an MLFlow experiment so that anything that needs to be logged during the training process is organized in the experiment.  
 # MAGIC   
 # MAGIC Additionally, we define the necessary libraries in a `conda_env` structure to be logged along with the model so that when it is deployed the necessary libraries can be installed alongside it.
+# MAGIC
 
 # COMMAND ----------
 
@@ -359,6 +364,8 @@ with mlflow.start_run(nested=True, run_name=f"sentiment-analysis-model-{exp_run_
   # add signature and input_example
   input_df = pd.DataFrame([reviews_df.iloc[5836]["full_text"]], columns=["input"])
   signature = infer_signature(input_df)
+  
+  ## NOTE: I don't think we need line 29...test without
   mlflow.pytorch.log_model(trainer.model, artifact_path="pytorch-model", pickle_module=pickle, signature=signature, input_example=input_df)
   # log artifacts, objects, and model
   # pass the model object, the max_length value, and the vocab object to the broader PyFunc Definition to be
@@ -436,52 +443,25 @@ pred
 
 # COMMAND ----------
 
-def func_create_endpoint(instance, model_serving_endpoint_name, endpoint_config):
-  #get endpoint status
-  endpoint_url = f"https://{instance}/api/2.0/serving-endpoints"
-  url = f"{endpoint_url}/{model_serving_endpoint_name}"
-  r = requests.get(url, headers=headers)
-  if "RESOURCE_DOES_NOT_EXIST" in r.text:  
-    print("Creating this new endpoint: ", f"https://{instance}/serving-endpoints/{model_serving_endpoint_name}/invocations")
-    re = requests.post(endpoint_url, headers=headers, json=endpoint_config)
+def create_model_srv_endpoint (url, endpoint_name, endpoint_config):
+  url = f'https://{url}/api/2.0/serving-endpoints/'
+  token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+  headers = {
+    "Authorization": f"Bearer {token}",
+    "Content-Type": "application/json",
+  }
+  r = requests.post(url, headers=headers, json=endpoint_config)
+  if r.status_code == 200:
+    print("Creating endpoint: ", f"{url}{endpoint_name}/invocations")
   else:
-    new_model_version = (endpoint_config['config'])['served_models'][0]['model_version']
-    print("This endpoint existed previously! We are updating it to a new config with new model version: ", new_model_version)
-    # update config
-    url = f"{endpoint_url}/{model_serving_endpoint_name}/config"
-    re = requests.put(url, headers=headers, json=endpoint_config['config']) 
-    # wait till new config file in place
-    import time,json
-    #get endpoint status
-    url = f"https://{instance}/api/2.0/serving-endpoints/{model_serving_endpoint_name}"
-    retry = True
-    total_wait = 0
-    while retry:
-      r = requests.get(url, headers=headers)
-      assert r.status_code == 200, f"Expected an HTTP 200 response when accessing endpoint info, received {r.status_code}"
-      endpoint = json.loads(r.text)
-      if "pending_config" in endpoint.keys():
-        seconds = 10
-        print("New config still pending")
-        if total_wait < 6000:
-          #if less the 10 mins waiting, keep waiting
-          print(f"Wait for {seconds} seconds")
-          print(f"Total waiting time so far: {total_wait} seconds")
-          time.sleep(10)
-          total_wait += seconds
-        else:
-          print(f"Stopping,  waited for {total_wait} seconds")
-          retry = False  
-      else:
-        print("New config in place now!")
-        retry = False
-  assert re.status_code == 200, f"Expected an HTTP 200 response, received {re.status_code}"
+    print("Creation failed", r.text)
+
 
 # COMMAND ----------
 
 from mlflow.tracking.client import MlflowClient
 def get_latest_model_version(model_name):
-  client = MlflowClient()
+  mlflow_client = MlflowClient()
   models = mlflow_client.get_latest_versions(model_name, stages=["Production"])
   for m in models:
     new_model_version = m.version
@@ -490,7 +470,7 @@ def get_latest_model_version(model_name):
 # COMMAND ----------
 
 endpoint_config = {
-  "name": model_serving_endpoint_name,
+  "name": model_name+"_endpoint_srv",
   "config": {
    "served_models": [{
      "model_name": model_name,
@@ -508,7 +488,46 @@ endpoint_config = {
 
 # COMMAND ----------
 
-func_create_endpoint(model_serving_endpoint_name)
+# MAGIC %md
+# MAGIC **NOTE**: Replace `ENTER URL HERE` with whatever databricks instance name is in between `https://` and the `/` before `o?=XXXXXX`.
+
+# COMMAND ----------
+
+url = "e2-demo-field-eng.cloud.databricks.com"
+
+# COMMAND ----------
+
+create_model_srv_endpoint(url, model_name+"_endpoint_srv", endpoint_config)
+
+# COMMAND ----------
+
+def get_status_of_endpoint (url, endpoint_name):
+  url = f'https://{url}/api/2.0/serving-endpoints/{endpoint_name}'
+  token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
+  headers = {
+    "Authorization": f"Bearer {token}",
+    "Content-Type": "application/json",
+  }
+  r = requests.get(url, headers=headers)
+  if r.status_code == 200:
+    ready_status = r.json()["state"]["ready"] == "READY"
+    return ready_status
+  else:
+    print("Error getting status", r.text)
+
+# COMMAND ----------
+
+import time
+time_waited = 0
+endpoint_ready = get_status_of_endpoint(url, model_name+"_endpoint_srv")
+while not endpoint_ready:
+  endpoint_ready = True if get_status_of_endpoint(url, model_name+"_endpoint_srv") else False
+  if not endpoint_ready:
+    time.sleep(30)
+    time_waited+=30
+    print("Endpoint not ready", f"-- Time waited: {str(time_waited/60)} minutes")
+  else:
+    print("Endpoint ready!")
 
 # COMMAND ----------
 
@@ -530,14 +549,6 @@ def score_model(instance, endpoint_name, dataset):
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC **NOTE**: Replace `ENTER URL HERE` with whatever databricks instance name is in between `https://` and the `/` before `o?=XXXXXX`.
-
-# COMMAND ----------
-
-url = "ENTER URL HERE"
-
-# COMMAND ----------
-
 import requests
-score_model(url, "sentiment_analysis_endpoint", input_df)
+input_df = pd.DataFrame([reviews_df.iloc[5837]["full_text"]], columns=["input"])
+score_model(url, model_name+"_endpoint_srv", input_df)
