@@ -364,9 +364,6 @@ with mlflow.start_run(nested=True, run_name=f"sentiment-analysis-model-{exp_run_
   # add signature and input_example
   input_df = pd.DataFrame([reviews_df.iloc[5836]["full_text"]], columns=["input"])
   signature = infer_signature(input_df)
-  
-  ## NOTE: I don't think we need line 29...test without
-  mlflow.pytorch.log_model(trainer.model, artifact_path="pytorch-model", pickle_module=pickle, signature=signature, input_example=input_df)
   # log artifacts, objects, and model
   # pass the model object, the max_length value, and the vocab object to the broader PyFunc Definition to be
   # packaged and logged with this run so that it can be properly containerized and serving using Model Serving
@@ -493,7 +490,7 @@ endpoint_config = {
 
 # COMMAND ----------
 
-url = "e2-demo-field-eng.cloud.databricks.com"
+url = "ENTER URL HERE"
 
 # COMMAND ----------
 
